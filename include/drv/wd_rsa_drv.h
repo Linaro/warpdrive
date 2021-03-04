@@ -50,6 +50,7 @@ struct wd_rsa_driver {
 	void (*exit)(void *priv);
 	int (*send)(handle_t sess, struct wd_rsa_msg *msg);
 	int (*recv)(handle_t sess, struct wd_rsa_msg *msg);
+	void (*enable_interrupt)(handle_t sess, bool enable);
 };
 
 void wd_rsa_set_driver(struct wd_rsa_driver *drv);

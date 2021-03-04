@@ -565,6 +565,7 @@ static struct wd_rsa_driver rsa_hisi_hpre = {
 	.exit			= hpre_exit,
 	.send			= rsa_send,
 	.recv			= rsa_recv,
+	.enable_interrupt	= hisi_qm_enable_interrupt,
 };
 
 static int fill_dh_xp_params(struct wd_dh_msg *msg,

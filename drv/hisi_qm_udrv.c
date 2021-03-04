@@ -478,6 +478,19 @@ static int hisi_qm_recv_single(struct hisi_qm_queue_info *q_info, void *resp)
 	return 0;
 }
 
+void hisi_qm_enable_interrupt(handle_t ctx, bool enable)
+{
+	handle_t h_qp = (handle_t)wd_ctx_get_priv(ctx);
+	struct hisi_qp *qp = (struct hisi_qp *)h_qp;
+	struct hisi_qm_queue_info *q_info =  &qp->q_info;
+	int idx = q_info->cq_head_index;
+
+	if (enable)
+		q_info->db(q_info, DOORBELL_CMD_CQ, idx, 1);
+	else
+		q_info->db(q_info, DOORBELL_CMD_CQ, idx, 0);
+}
+
 int hisi_qm_recv(handle_t h_qp, void *resp, __u16 expect, __u16 *count)
 {
 	struct hisi_qp *qp = (struct hisi_qp *)h_qp;

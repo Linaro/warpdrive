@@ -159,5 +159,6 @@ void hisi_qm_sgl_copy(void *dst_buff, void *hw_sgl, __u32 offset,
  * This interface does not add locks, guaranteed by the caller
  */
 int hisi_qm_get_free_sqe_num(handle_t h_qp);
+void hisi_qm_enable_interrupt(handle_t ctx, bool enable);
 
 #endif
