@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #include <limits.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -275,6 +276,9 @@ static int hisi_qm_get_qfrs_offs(handle_t h_ctx,
 static int hisi_qm_setup_info(struct hisi_qp *qp, struct hisi_qm_priv *config)
 {
 	struct hisi_qm_queue_info *q_info = NULL;
+#if 1
+	struct hisi_concurrent_queue data;
+#endif
 	int ret;
 
 	q_info = &qp->q_info;
@@ -311,25 +315,24 @@ static int hisi_qm_setup_info(struct hisi_qp *qp, struct hisi_qm_priv *config)
 	q_info->ds_rx_base = q_info->ds_tx_base - sizeof(uint32_t);
 
 	pthread_spin_init(&q_info->lock, PTHREAD_PROCESS_SHARED);
+	pthread_mutex_init(&q_info->m_lock, NULL);
+
+#if 1
+	data.idx = 0;
+	data.tag = 0;
+	__atomic_store(&q_info->ccrnt_head, &data, __ATOMIC_RELEASE);
+	__atomic_store(&q_info->ccrnt_tail, &data, __ATOMIC_RELEASE);
+	__atomic_store(&q_info->ccrnt_hw_head, &data, __ATOMIC_RELEASE);
+	__atomic_store(&q_info->ccrnt_hw_tail, &data, __ATOMIC_RELEASE);
+	data.idx = 1;
+	__atomic_store(&q_info->ccrnt_phase, &data, __ATOMIC_RELEASE);
+#endif
 
 	return 0;
 
 err_out:
 	hisi_qm_unset_region(qp->h_ctx, q_info);
 	return ret;
-}
-
-static int get_free_num(struct hisi_qm_queue_info *q_info)
-{
-	/* The device should reserve one buffer. */
-	return (QM_Q_DEPTH - 1) - q_info->used_num;
-}
-
-int hisi_qm_get_free_sqe_num(handle_t h_qp)
-{
-	struct hisi_qp *qp = (struct hisi_qp *)h_qp;
-
-	return get_free_num(&qp->q_info);
 }
 
 handle_t hisi_qm_alloc_qp(struct hisi_qm_priv *config, handle_t ctx)
@@ -397,6 +400,189 @@ void hisi_qm_free_qp(handle_t h_qp)
 	free(qp);
 }
 
+/*
+ * There're two FIFOs. One is sending FIFO, SQ. And the other is receiving
+ * FIFO, CQ. The message order in CQ is exactly same as message order in SQ.
+ * From software view, it could be abstracted as one virtual FIFO.
+ * Enqueque: Driver accesses sq_tail.
+ * Dequeue: Driver accesses sq_head only if there's one polling thread.
+ * Free Slots: Check the left slots by sq_head, sq_tail & total slots.
+ */
+/*
+ * Opertions on Concurrent Queue
+ */
+int hisi_ccrnt_avail_slots(struct hisi_qm_queue_info *q_info)
+{
+	struct hisi_concurrent_queue head, tail;
+
+	__atomic_load(&q_info->ccrnt_head, &head, __ATOMIC_ACQUIRE);
+	__atomic_load(&q_info->ccrnt_tail, &tail, __ATOMIC_ACQUIRE);
+	return (int)((QM_Q_DEPTH + tail.idx + 1 - head.idx) % QM_Q_DEPTH);
+}
+
+/*
+ * Enqueue is a block operation.
+ * If queue is busy, send requests as much as possible.
+ * If there're 10 request, only 2 slots are available. Just send 2 request.
+ * If there's no one slot left, just retry 10 times.
+ */
+int hisi_ccrnt_enqueue(struct hisi_qm_queue_info *q_info,
+		      void *req,
+		      __u16 expect,
+		      __u16 *count)
+{
+	struct hisi_concurrent_queue head, tail, next_tail, hw_tail;
+	int retry = 100;
+	__u16 avail_slots, send_slots;
+	bool ret;
+
+	do {
+		__atomic_load(&q_info->ccrnt_head, &head, __ATOMIC_ACQUIRE);
+		__atomic_load(&q_info->ccrnt_tail, &tail, __ATOMIC_ACQUIRE);
+		/* calculate used slots */
+		avail_slots = (QM_Q_DEPTH + tail.idx - head.idx) % QM_Q_DEPTH;
+		/* calculate available slots */
+		avail_slots = QM_Q_DEPTH - avail_slots;
+		if (!avail_slots) {
+			if (retry--) {
+				sched_yield();
+				continue;
+			} else {
+				WD_ERR("Fail to get slots from queue!\n");
+				return -WD_EBUSY;
+			}
+		}
+		/* If slots are not enough, just use them. */
+		send_slots = (expect > avail_slots) ? avail_slots : expect;
+		next_tail.idx = (tail.idx + send_slots) % QM_Q_DEPTH;
+		next_tail.tag = tail.tag + 1;
+		ret = __atomic_compare_exchange(&q_info->ccrnt_tail,
+						&tail,
+						&next_tail,
+						false,
+						__ATOMIC_ACQ_REL,
+						__ATOMIC_RELAXED);
+		/* If another thread has updated tail, it fails. */
+		if (!ret)
+			continue;
+		hisi_qm_fill_sqe(req, q_info, tail.idx, send_slots);
+		*count = send_slots;
+	} while (!avail_slots);
+
+	/*
+	 * Make sure the sequence. Can't avoid to use lock.
+	 */
+	while (1) {
+		ret = pthread_spin_lock(&q_info->lock);
+		//pthread_mutex_lock(&q_info->m_lock);
+		/* check whether current tail equals to hw_tail */
+		__atomic_load(&q_info->ccrnt_hw_tail, &hw_tail, __ATOMIC_ACQUIRE);
+		if (tail.idx != hw_tail.idx) {
+			pthread_spin_unlock(&q_info->lock);
+			//pthread_mutex_unlock(&q_info->m_lock);
+			sched_yield();
+			continue;
+		}
+		__atomic_store(&q_info->ccrnt_hw_tail, &next_tail,
+				__ATOMIC_RELEASE);
+		q_info->db(q_info, DOORBELL_CMD_SQ, next_tail.idx, 0);
+		pthread_spin_unlock(&q_info->lock);
+		//pthread_mutex_unlock(&q_info->m_lock);
+		break;
+	}
+	return 0;
+}
+
+/* dequeue one slot */
+int hisi_ccrnt_dequeue(struct hisi_qm_queue_info *q_info, void *resp)
+{
+	struct hisi_concurrent_queue head, next_head, hw_head;
+	struct hisi_concurrent_queue phase, next_phase;
+	struct cqe *cqe;
+	__u32 sq_reg, status_reg;
+	__u32 i;
+	bool phase_bit, ret = false;
+	void *sqe_addr;
+
+	do {
+		__atomic_load(&q_info->ccrnt_head, &head, __ATOMIC_ACQUIRE);
+		next_head.idx = (head.idx + 1) % QM_Q_DEPTH;
+		next_head.tag = head.tag + 1;
+		cqe = q_info->cq_base + head.idx * sizeof(struct cqe);
+		/* read status register */
+		status_reg = wd_ioread32((void *)((uintptr_t)cqe + 12));
+		sq_reg = wd_ioread32((void *)((uintptr_t)cqe + 8));
+		phase_bit = status_reg & 0x10000;
+		/* check whether could receive any new message */
+		if (phase_bit && phase.idx) {
+			/* invalid message */
+			i = sq_reg & 0xffff;
+			if (i >= QM_Q_DEPTH) {
+				WD_ERR("CQE_SQ_HEAD_INDEX(%d) is error\n", i);
+				return -WD_EIO;
+			}
+		} else
+			return -WD_EAGAIN;
+		__atomic_load(&q_info->ccrnt_phase, &phase, __ATOMIC_ACQUIRE);
+		next_phase.idx = (!next_head.idx) ? !phase.idx : phase.idx;
+		next_phase.tag = phase.tag + 1;
+		ret = __atomic_compare_exchange(&q_info->ccrnt_phase,
+						&phase,
+						&next_phase,
+						false,
+						__ATOMIC_ACQ_REL,
+						__ATOMIC_RELAXED);
+		if (!ret)
+			continue;
+		ret = __atomic_compare_exchange(&q_info->ccrnt_head,
+						&head,
+						&next_head,
+						false,
+						__ATOMIC_ACQ_REL,
+						__ATOMIC_RELAXED);
+		if (!ret)
+			continue;
+		sqe_addr = q_info->sq_base + i * q_info->sqe_size;
+		memcpy(resp, (void *)sqe_addr, q_info->sqe_size);
+	} while (!ret);
+
+	/*
+	 * Make sure the sequence. Can't avoid to use lock.
+	 */
+	while (1) {
+		ret = pthread_spin_lock(&q_info->lock);
+		//pthread_mutex_lock(&q_info->m_lock);
+		/* check whether current head euquals to hw_head */
+		__atomic_load(&q_info->ccrnt_hw_head, &hw_head, __ATOMIC_ACQUIRE);
+		if (head.idx != hw_head.idx) {
+			pthread_spin_unlock(&q_info->lock);
+			//pthread_mutex_unlock(&q_info->m_lock);
+			sched_yield();
+			continue;
+		}
+		__atomic_store(&q_info->ccrnt_hw_head, &next_head,
+				__ATOMIC_RELEASE);
+		q_info->db(q_info, DOORBELL_CMD_CQ, i, 0);
+		pthread_spin_unlock(&q_info->lock);
+		//pthread_mutex_unlock(&q_info->m_lock);
+		break;
+	}
+	return 0;
+}
+
+static int get_free_num(struct hisi_qm_queue_info *q_info)
+{
+	/* The device should reserve one buffer. */
+	return (QM_Q_DEPTH - 1) - q_info->used_num;
+}
+
+int hisi_qm_get_free_sqe_num(handle_t h_qp)
+{
+	struct hisi_qp *qp = (struct hisi_qp *)h_qp;
+
+	return get_free_num(&qp->q_info);
+}
+
 int hisi_qm_send(handle_t h_qp, void *req, __u16 expect, __u16 *count)
 {
 	struct hisi_qp *qp = (struct hisi_qp *)h_qp;
@@ -412,8 +598,8 @@ int hisi_qm_send(handle_t h_qp, void *req, __u16 expect, __u16 *count)
 	pthread_spin_lock(&q_info->lock);
 
 	if (wd_ioread32(q_info->ds_tx_base) == 1) {
-		WD_ERR("wd queue hw error happened before qm send!\n");
 		pthread_spin_unlock(&q_info->lock);
+		WD_ERR("wd queue hw error happened before qm send!\n");
 		return -WD_HW_EACCESS;
 	}
 
@@ -443,18 +629,21 @@ static int hisi_qm_recv_single(struct hisi_qm_queue_info *q_info, void *resp)
 	struct cqe *cqe;
 	__u16 i, j;
 
+	pthread_spin_lock(&q_info->lock);
 	i = q_info->cq_head_index;
 	cqe = q_info->cq_base + i * sizeof(struct cqe);
 
 	if (q_info->cqc_phase == CQE_PHASE(cqe)) {
 		j = CQE_SQ_HEAD_INDEX(cqe);
 		if (j >= QM_Q_DEPTH) {
+			pthread_spin_unlock(&q_info->lock);
 			WD_ERR("CQE_SQ_HEAD_INDEX(%d) error\n", j);
 			return -WD_EIO;
 		}
 		memcpy(resp, (void *)((uintptr_t)q_info->sq_base +
 			j * q_info->sqe_size), q_info->sqe_size);
 	} else {
+		pthread_spin_unlock(&q_info->lock);
 		return -WD_EAGAIN;
 	}
 
@@ -471,7 +660,6 @@ static int hisi_qm_recv_single(struct hisi_qm_queue_info *q_info, void *resp)
 	q_info->cq_head_index = i;
 	q_info->sq_head_index = i;
 
-	pthread_spin_lock(&q_info->lock);
 	q_info->used_num--;
 	pthread_spin_unlock(&q_info->lock);
 

@@ -14,6 +14,10 @@
 #define ASIZE		(2 * 512 * 1024)
 #define HW_CTX_SIZE	(64*1024)
 
+#define MAX_RETRY_COUNTS	200000000
+
+#define OPTIMIZE_LOCK
+
 enum alg_type {
 	HW_DEFLATE = 0x1,
 	HW_ZLIB,
@@ -506,7 +510,11 @@ static int fill_zip_comp_sqe(struct hisi_qp *qp, struct wd_comp_msg *msg,
 static int hisi_zip_comp_send(handle_t ctx, struct wd_comp_msg *msg, void *priv)
 {
 	struct hisi_qp *qp = wd_ctx_get_priv(ctx);
+#ifdef OPTIMIZE_LOCK
+	struct hisi_qm_queue_info *q_info;
+#else
 	handle_t h_qp = (handle_t)qp;
+#endif
 	struct hisi_zip_sqe sqe = {0};
 	__u16 count = 0;
 	int ret;
@@ -526,9 +534,16 @@ static int hisi_zip_comp_send(handle_t ctx, struct wd_comp_msg *msg, void *priv)
 		WD_ERR("failed to fill zip sqe(%d)!\n", ret);
 		return ret;
 	}
+#ifdef OPTIMIZE_LOCK
+	q_info = &qp->q_info;
+	ret = hisi_ccrnt_enqueue(q_info, &sqe, 1, &count);
+	if (ret < 0)
+		WD_ERR("enqueue is wrong (%d)!\n", ret);
+#else
 	ret = hisi_qm_send(h_qp, &sqe, 1, &count);
 	if (ret < 0)
 		WD_ERR("qm send is err(%d)!\n", ret);
+#endif
 
 	return ret;
 }
@@ -548,8 +563,10 @@ static int parse_zip_sqe(struct hisi_qp *qp, struct hisi_zip_sqe *sqe,
 		       ctx_st, status, type);
 		recv_msg->req.status = WD_IN_EPARA;
 	} else {
-		if (!sqe->produced)
+		if (!sqe->produced) {
+			WD_ERR("#%s, %d, produced:%d, consumed:%d\n", __func__, __LINE__, sqe->produced, sqe->consumed);
 			return -WD_EAGAIN;
+		}
 		recv_msg->req.status = 0;
 	}
 
@@ -593,16 +610,64 @@ static int hisi_zip_comp_recv(handle_t ctx, struct wd_comp_msg *recv_msg,
 			      void *priv)
 {
 	struct hisi_qp *qp = wd_ctx_get_priv(ctx);
-	handle_t h_qp = (handle_t)qp;
 	struct hisi_zip_sqe sqe = {0};
+#ifdef OPTIMIZE_LOCK
+	struct hisi_qm_queue_info *q_info;
+#else
+	handle_t h_qp = (handle_t)qp;
 	__u16 count = 0;
+#endif
+	__u64 recv_count = 0;
 	int ret;
 
-	ret = hisi_qm_recv(h_qp, &sqe, 1, &count);
-	if (ret < 0)
-		return ret;
-
-	return parse_zip_sqe(qp, &sqe, recv_msg);
+#ifdef OPTIMIZE_LOCK
+	do {
+		q_info = &qp->q_info;
+		ret = hisi_ccrnt_dequeue(q_info, &sqe);
+		if (ret == -WD_HW_EACCESS) {
+			WD_ERR("hisi comp recv hw err!\n");
+			return ret;
+		} else if (ret == -WD_EAGAIN) {
+			if (++recv_count > MAX_RETRY_COUNTS) {
+				WD_ERR("hisi comp recv timeout fail!\n");
+				ret = -WD_ETIMEDOUT;
+				return ret;
+			}
+		}
+		ret = parse_zip_sqe(qp, &sqe, recv_msg);
+		if (ret == -WD_EAGAIN) {
+			if (++recv_count > MAX_RETRY_COUNTS) {
+				WD_ERR("hisi comp parse sqe timeout fail!\n");
+				ret = -WD_ETIMEDOUT;
+				return ret;
+			}
+		}
+	} while (ret == -WD_EAGAIN);
+	return ret;
+#else
+	do {
+		ret = hisi_qm_recv(h_qp, &sqe, 1, &count);
+		if (ret == -WD_HW_EACCESS) {
+			WD_ERR("hisi comp recv hw err!\n");
+			return ret;
+		} else if (ret == -WD_EAGAIN) {
+			if (++recv_count > MAX_RETRY_COUNTS) {
+				WD_ERR("hisi comp recv timeout fail!\n");
+				ret = -WD_ETIMEOUT;
+				return ret;
+			}
+		}
+		ret = parse_zip_sqe(qp, &sqe, recv_msg);
+		if (ret == -WD_EAGAIN) {
+			if (++recv_count > MAX_RETRY_COUNTS) {
+				WD_ERR("hisi comp parse sqe timeout fail!\n");
+				ret = -WD_ETIMEDOUT;
+				return ret;
+			}
+		}
+	} while (ret == -WD_EAGAIN);
+	return ret;
+#endif
 }
 
 struct wd_comp_driver hisi_zip = {

@@ -39,6 +39,21 @@ struct hisi_qm_priv {
 	__u16 op_type;
 };
 
+struct hisi_qm_sq {
+	__u16	head;
+	__u16	tail;
+};
+
+/* how to check whether receiving queue is empty or not */
+struct hisi_qm_cq {
+	__u16	head;
+};
+
+struct hisi_concurrent_queue {
+	__u16	idx;
+	__u16	tag;
+};
+
 struct hisi_qm_queue_info {
 	void *sq_base;
 	void *cq_base;
@@ -49,6 +64,14 @@ struct hisi_qm_queue_info {
 		  __u16 index, __u8 priority);
 	void *ds_tx_base;
 	void *ds_rx_base;
+	struct hisi_concurrent_queue	ccrnt_head;	/* software */
+	struct hisi_concurrent_queue	ccrnt_tail;	/* software */
+	/*
+	 *
+	 */
+	struct hisi_concurrent_queue	ccrnt_hw_head;	/* hardware */
+	struct hisi_concurrent_queue	ccrnt_hw_tail;	/* hardware */
+	struct hisi_concurrent_queue	ccrnt_phase;
 	__u16 sq_tail_index;
 	__u16 sq_head_index;
 	__u16 cq_head_index;
@@ -58,6 +81,7 @@ struct hisi_qm_queue_info {
 	__u16 hw_type;
 	bool cqc_phase;
 	pthread_spinlock_t lock;
+	pthread_mutex_t m_lock;
 	unsigned long region_size[UACCE_QFRT_MAX];
 };
 
@@ -160,4 +184,8 @@ void hisi_qm_sgl_copy(void *dst_buff, void *hw_sgl, __u32 offset,
  */
 int hisi_qm_get_free_sqe_num(handle_t h_qp);
 
+int hisi_ccrnt_avail_slots(struct hisi_qm_queue_info *q_info);
+int hisi_ccrnt_enqueue(struct hisi_qm_queue_info *q_info, void *req,
+		      __u16 expect, __u16 *count);
+int hisi_ccrnt_dequeue(struct hisi_qm_queue_info *q_info, void *resp);
 #endif

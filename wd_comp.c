@@ -2,7 +2,6 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -341,7 +340,6 @@ int wd_do_comp_sync(handle_t h_sess, struct wd_comp_req *req)
 	void *priv = wd_comp_setting.priv;
 	struct wd_comp_msg msg, resp_msg;
 	struct wd_ctx_internal *ctx;
-	__u64 recv_count = 0;
 	__u32 index;
 	int ret;
 
@@ -376,30 +374,17 @@ int wd_do_comp_sync(handle_t h_sess, struct wd_comp_req *req)
 	msg.alg_type = sess->alg_type;
 	msg.stream_mode = WD_COMP_STATELESS;
 
-	pthread_spin_lock(&ctx->lock);
-
 	ret = wd_comp_setting.driver->comp_send(ctx->ctx, &msg, priv);
 	if (ret < 0) {
 		WD_ERR("wd comp send err(%d)!\n", ret);
 		goto err_out;
 	}
 	resp_msg.ctx_buf = sess->ctx_buf;
-	do {
-		ret = wd_comp_setting.driver->comp_recv(ctx->ctx, &resp_msg,
-							priv);
-		if (ret == -WD_HW_EACCESS) {
-			WD_ERR("wd comp recv hw err!\n");
-			goto err_out;
-		} else if (ret == -WD_EAGAIN) {
-			if (++recv_count > MAX_RETRY_COUNTS) {
-				WD_ERR("wd comp recv timeout fail!\n");
-				ret = -WD_ETIMEDOUT;
-				goto err_out;
-			}
-		}
-	} while (ret == -WD_EAGAIN);
-
-	pthread_spin_unlock(&ctx->lock);
+	ret = wd_comp_setting.driver->comp_recv(ctx->ctx, &resp_msg, priv);
+	if (ret < 0) {
+		WD_ERR("wd comp recv err(%d)!\n", ret);
+		goto err_out;
+	}
 
 	req->src_len = resp_msg.in_cons;
 	req->dst_len = resp_msg.produced;
@@ -408,7 +393,6 @@ int wd_do_comp_sync(handle_t h_sess, struct wd_comp_req *req)
 	return 0;
 
 err_out:
-	pthread_spin_unlock(&ctx->lock);
 	return ret;
 }
 
@@ -549,8 +533,6 @@ int wd_do_comp_strm(handle_t h_sess, struct wd_comp_req *req)
 	msg.req.last = req->last;
 	msg.stream_mode = WD_COMP_STATEFUL;
 
-	pthread_spin_lock(&ctx->lock);
-
 	ret = wd_comp_setting.driver->comp_send(ctx->ctx, &msg, priv);
 	if (ret < 0) {
 		WD_ERR("wd comp send err(%d)!\n", ret);
@@ -572,8 +554,6 @@ int wd_do_comp_strm(handle_t h_sess, struct wd_comp_req *req)
 		}
 	} while (ret == -WD_EAGAIN);
 
-	pthread_spin_unlock(&ctx->lock);
-
 	req->src_len = resp_msg.in_cons;
 	req->dst_len = resp_msg.produced;
 	req->status = resp_msg.req.status;
@@ -585,7 +565,6 @@ int wd_do_comp_strm(handle_t h_sess, struct wd_comp_req *req)
 	return 0;
 
 err_out:
-	pthread_spin_unlock(&ctx->lock);
 	return ret;
 }
 
@@ -634,15 +613,11 @@ int wd_do_comp_async(handle_t h_sess, struct wd_comp_req *req)
 	msg->alg_type = sess->alg_type;
 	msg->stream_mode = WD_COMP_STATELESS;
 
-	pthread_spin_lock(&ctx->lock);
-
 	ret = wd_comp_setting.driver->comp_send(ctx->ctx, msg, priv);
 	if (ret < 0) {
 		WD_ERR("wd comp send err(%d)!\n", ret);
 		wd_put_msg_to_pool(&wd_comp_setting.pool, index, msg->tag);
 	}
-
-	pthread_spin_unlock(&ctx->lock);
 
 	return ret;
 }
