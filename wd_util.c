@@ -369,16 +369,17 @@ static int wd_parse_ctx_num(struct wd_env_config *config, const char *s,
 {
 	struct wd_env_config_per_numa *config_numa = config->config_per_numa;
 	int ctx_num, node, i, ret;
-	char *n, *p;
+	char *n, *p, *dup;
 
-	n = strdup(s);
-	if (!n)
+	dup = strdup(s);
+	if (!dup)
 		return -ENOMEM;
 
+	n = dup;
 	while ((p = strsep(&n, ","))) {
 		ret = parse_ctx_num_on_numa(p, &ctx_num, &node);
 		if (ret) {
-			free(n);
+			free(dup);
 			return -WD_EINVAL;
 		}
 
@@ -392,7 +393,7 @@ static int wd_parse_ctx_num(struct wd_env_config *config, const char *s,
 		 */
 		if (i == config->numa_num && i != 1) {
 			WD_ERR("wrong numa node value: %s!\n", p);
-			free(n);
+			free(dup);
 			return -WD_EINVAL;
 		}
 
@@ -402,7 +403,7 @@ static int wd_parse_ctx_num(struct wd_env_config *config, const char *s,
 			config_numa->async_ctx_num = ctx_num;
 	}
 
-	free(n);
+	free(dup);
 
 	return 0;
 }
@@ -499,12 +500,13 @@ int wd_parse_comp_ctx_type(struct wd_env_config *config, const char *s)
 	struct wd_env_config_per_numa *config_numa = config->config_per_numa;
 	struct wd_ctx_range **ctx_table;
 	int ctx_num, node, i, ret;
-	char *n, *p, *c;
+	char *n, *p, *c, *dup;
 
-	n = strdup(s);
-	if (!n)
+	dup = strdup(s);
+	if (!dup)
 		return -ENOMEM;
 
+	n = dup;
 	while ((p = strsep(&n, ","))) {
 		config_numa = config->config_per_numa;
 		c = index(p, ':');
@@ -551,7 +553,7 @@ int wd_parse_comp_ctx_type(struct wd_env_config *config, const char *s)
 		goto err_free_ctx_table;
 	}
 
-	free(n);
+	free(dup);
 
 	return 0;
 
@@ -559,7 +561,7 @@ err_free_ctx_table:
 	for (i = 0; i < config->numa_num; config_numa++, i++)
 		if (config_numa->ctx_table)
 			free(config_numa->ctx_table);
-	free(n);
+	free(dup);
 	return ret;
 }
 
