@@ -720,9 +720,13 @@ static struct wd_ctx_config *wd_alloc_ctx(struct wd_env_config *config,
 			config_numa->numa_disable = 1;
 			continue;
 		}
-
-		memcpy(&config_numa->dev, list->dev, sizeof(*list->dev));
-		ctx_num += config_numa->sync_ctx_num + config_numa->async_ctx_num;
+		if (config_numa->sync_ctx_num + config_numa->async_ctx_num) {
+			memcpy(&config_numa->dev, list->dev,
+			       sizeof(*list->dev));
+			ctx_num += config_numa->sync_ctx_num +
+				   config_numa->async_ctx_num;
+		} else
+			config_numa->numa_disable = 1;
 	}
 
 	wd_free_list_accels(head);
