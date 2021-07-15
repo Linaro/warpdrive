@@ -369,16 +369,17 @@ static int wd_parse_ctx_num(struct wd_env_config *config, const char *s,
 {
 	struct wd_env_config_per_numa *config_numa = config->config_per_numa;
 	int ctx_num, node, i, ret;
-	char *n, *p;
+	char *n, *p, *dup;
 
-	n = strdup(s);
-	if (!n)
+	dup = strdup(s);
+	if (!dup)
 		return -ENOMEM;
 
+	n = dup;
 	while ((p = strsep(&n, ","))) {
 		ret = parse_ctx_num_on_numa(p, &ctx_num, &node);
 		if (ret) {
-			free(n);
+			free(dup);
 			return -WD_EINVAL;
 		}
 
@@ -392,7 +393,7 @@ static int wd_parse_ctx_num(struct wd_env_config *config, const char *s,
 		 */
 		if (i == config->numa_num && i != 1) {
 			WD_ERR("wrong numa node value: %s!\n", p);
-			free(n);
+			free(dup);
 			return -WD_EINVAL;
 		}
 
@@ -402,7 +403,7 @@ static int wd_parse_ctx_num(struct wd_env_config *config, const char *s,
 			config_numa->async_ctx_num = ctx_num;
 	}
 
-	free(n);
+	free(dup);
 
 	return 0;
 }
@@ -499,12 +500,13 @@ int wd_parse_comp_ctx_type(struct wd_env_config *config, const char *s)
 	struct wd_env_config_per_numa *config_numa = config->config_per_numa;
 	struct wd_ctx_range **ctx_table;
 	int ctx_num, node, i, ret;
-	char *n, *p, *c;
+	char *n, *p, *c, *dup;
 
-	n = strdup(s);
-	if (!n)
+	dup = strdup(s);
+	if (!dup)
 		return -ENOMEM;
 
+	n = dup;
 	while ((p = strsep(&n, ","))) {
 		config_numa = config->config_per_numa;
 		c = index(p, ':');
@@ -551,7 +553,7 @@ int wd_parse_comp_ctx_type(struct wd_env_config *config, const char *s)
 		goto err_free_ctx_table;
 	}
 
-	free(n);
+	free(dup);
 
 	return 0;
 
@@ -559,7 +561,7 @@ err_free_ctx_table:
 	for (i = 0; i < config->numa_num; config_numa++, i++)
 		if (config_numa->ctx_table)
 			free(config_numa->ctx_table);
-	free(n);
+	free(dup);
 	return ret;
 }
 
@@ -592,6 +594,7 @@ static int wd_parse_env(struct wd_env_config *config)
 static void wd_free_env(struct wd_env_config *config)
 {
 	struct wd_env_config_per_numa *config_numa = config->config_per_numa;
+	struct async_task_queue *async_queue;
 	int i, j;
 
 	for (i = 0; i < config->numa_num; config_numa++, i++) {
@@ -601,7 +604,9 @@ static void wd_free_env(struct wd_env_config *config)
 		for (j = 0; j < CTX_MODE_MAX; j++)
 			free(config_numa->ctx_table[j]);
 		free(config_numa->ctx_table);
-		free(config_numa->async_task_queue_array);
+		async_queue = (struct async_task_queue *)
+				config_numa->async_task_queue_array;
+		free(async_queue);
 	}
 	free(config->config_per_numa);
 }
@@ -715,9 +720,13 @@ static struct wd_ctx_config *wd_alloc_ctx(struct wd_env_config *config,
 			config_numa->numa_disable = 1;
 			continue;
 		}
-
-		memcpy(&config_numa->dev, list->dev, sizeof(*list->dev));
-		ctx_num += config_numa->sync_ctx_num + config_numa->async_ctx_num;
+		if (config_numa->sync_ctx_num + config_numa->async_ctx_num) {
+			memcpy(&config_numa->dev, list->dev,
+			       sizeof(*list->dev));
+			ctx_num += config_numa->sync_ctx_num +
+				   config_numa->async_ctx_num;
+		} else
+			config_numa->numa_disable = 1;
 	}
 
 	wd_free_list_accels(head);
@@ -858,7 +867,7 @@ static struct async_task_queue *find_async_queue(struct wd_env_config *config,
 			break;
 	}
 
-	return config_numa->async_task_queue_array;
+	return (struct async_task_queue *)config_numa->async_task_queue_array;
 }
 
 /* fix me: all return value here, and no config input */
@@ -1006,7 +1015,8 @@ static int wd_init_async_polling_thread_per_numa(struct wd_env_config *config,
 	task_queue = calloc(config_numa->async_ctx_num, sizeof(*head));
 	if (!task_queue)
 		return -ENOMEM;
-	config_numa->async_task_queue_array = head = task_queue;
+	head = task_queue;
+	config_numa->async_task_queue_array = (void *)head;
 
 	for (i = 0; i < config_numa->async_poll_num; task_queue++, i++) {
 		ret = wd_init_one_task_queue(task_queue, config->alg_poll_ctx);
